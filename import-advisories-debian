@@ -1,0 +1,145 @@
+#!/usr/bin/env python3.5
+
+import re
+import os
+import gzip
+import requests
+import argparse
+from datetime import datetime, timedelta
+import filecmp
+import json
+import shutil
+
+
+parser = argparse.ArgumentParser(description='Import advisories for Debian')
+parser.add_argument('--debug', help='Increase output verbosity', action="store_true")
+parser.add_argument('-d', '--destination', default='/tmp', help='Where to store the output files hierarchy.')
+args = parser.parse_args()
+
+sources_with_binaries = {}
+
+
+def sources_gz(distro):
+
+    sections = ['main', 'contrib', 'non-free']
+    regex = re.compile(r'^Package:\s+(.*)\nBinary:((?:\s.*(?:\n|$))+)', re.MULTILINE)
+
+    sources = {}
+
+    # Go over our Sources.* possibilities until we can download one
+    for section in sections:
+
+        for uri in [
+            'http://ftp.debian.org/debian/dists/{}/{}/source/Sources.gz'.format(distro, section),
+            'http://security.debian.org/debian-security/dists/{}/updates/{}/source/Sources.gz'.format(distro, section)
+        ]:
+
+            print('Downloading {}'.format(uri))
+            r = requests.get(uri)
+
+            if r.status_code != 200:
+                raise Exception('Could not fetch {}'.format(uri))
+
+            if os.path.isfile('/tmp/sources.gz'):
+                os.unlink('/tmp/sources.gz')
+
+            # Download data
+            with open('/tmp/sources.gz', 'wb') as fd:
+                for chunk in r.iter_content():
+                    fd.write(chunk)
+
+            with gzip.open('/tmp/sources.gz', 'rb') as f:
+                sources_data = f.read()
+
+            sources_matches = regex.findall(sources_data.decode("utf-8"))
+
+            for source in sources_matches:
+                sources[source[0]] = [x.strip() for x in source[1].split(',')]
+
+    return sources
+
+
+def binary_packages(distro, package):
+
+    if distro not in sources_with_binaries.keys():
+        sources_with_binaries[distro] = sources_gz(distro)
+
+    if package not in sources_with_binaries[distro]:
+        raise Exception('Source package {} not in distro {}'.format(package, distro))
+
+    return sources_with_binaries[distro][package]
+
+data = ''
+for item in ['DSA', 'DLA']:
+	#r = requests.get('https://anonscm.debian.org/viewvc/secure-testing/data/{}/list'.format(item), params={'view': 'co'})
+	r = requests.get('https://salsa.debian.org/security-tracker-team/security-tracker/raw/master/data/{}/list'.format(item))
+	data += r.text
+
+regexMain = re.compile(r'^\[(?P<date>[^\]]*)\]\s+(?P<name>\S+)\s+(?P<description>.*)\n(?:\s+\{(?P<cve>[^}]+)\}.*\n)?(?P<srcpkgs>(?:\s.*(?:\n|$))+)', re.MULTILINE)
+regexSrcPackages = re.compile(r'^\s+\[(?P<release>[^\]]+)\]\s-\s(?P<name>\S+)\s(?P<version>.*)', re.MULTILINE)
+
+current_date = datetime.now().replace(day=1)
+for x in range(0,12):
+
+    advisories = {}
+
+    for m in regexMain.finditer(data):
+        group = m.groupdict()
+        created_at = datetime.strptime(group['date'], '%d %b %Y')
+
+        # Out of our timeframe,ignore.
+        if created_at.month != current_date.month or created_at.year != current_date.year:
+            continue
+
+        # Not all advisories have a list of CVE's.
+        if group['cve']:
+            cves = group['cve'].split(' ')
+        else:
+            cves = []
+
+        for m2 in regexSrcPackages.finditer(group['srcpkgs']):
+            srcpkg = m2.groupdict()
+            release = srcpkg['release']
+
+            # Start a new release list if needed
+            if release not in advisories:
+                advisories[release] = []
+
+            binpkgs = []
+            for binpkg in binary_packages(srcpkg['release'], srcpkg['name']):
+                binpkgs.append({'name': binpkg, 'version': srcpkg['version']})
+
+            advisories[release].append(
+                {
+                    'name': group['name'],
+                    'date': created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                    'description': group['description'],
+                    'cves': cves,
+                    'packages': {
+                        'source': [{'name': srcpkg['name'], 'version': srcpkg['version']}],
+                        'binary': binpkgs
+                    }
+
+                }
+            )
+
+    for release in advisories:
+
+        release_path = '{}/debian/{}/{}'.format(args.destination, release, current_date.year)
+        new_file = '{}/.{}.json'.format(release_path, current_date.strftime('%B').lower())
+        orig_file = '{}/{}.json'.format(release_path, current_date.strftime('%B').lower())
+
+        os.makedirs(release_path, exist_ok=True)
+
+        with open(new_file, 'w') as fp:
+            json.dump(advisories[release], fp=fp, indent=4, sort_keys=True)
+
+        if not os.path.isfile(orig_file) or not filecmp.cmp(new_file, orig_file):
+            print('Saving {}'.format(orig_file))
+            shutil.copyfile(new_file, orig_file)
+        else:
+            print('No changes for {}.'.format(orig_file))
+
+        os.unlink(new_file)
+
+    current_date = (current_date - timedelta(days=1)).replace(day=1)
