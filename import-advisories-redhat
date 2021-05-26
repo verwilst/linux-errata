@@ -1,0 +1,146 @@
+#!/usr/bin/env python3.5
+
+import requests
+import gzip
+import os
+import re
+from datetime import datetime, timedelta
+import json
+import argparse
+import filecmp
+import shutil
+import copy
+
+parser = argparse.ArgumentParser(description='Import advisories for RHEL')
+parser.add_argument('--debug', help='Increase output verbosity', action="store_true")
+parser.add_argument('-d', '--destination', default='/tmp', help='Where to store the output files hierarchy.')
+args = parser.parse_args()
+
+def splitFilename(filename):
+    """
+    Pass in a standard style rpm fullname
+    Return a { 'name' : name, 'version': version + release } dictionary
+    """
+
+    if filename[-4:] == '.rpm':
+        filename = filename[:-4]
+
+    archIndex = filename.rfind('.')
+    arch = filename[archIndex+1:]
+
+    relIndex = filename[:archIndex].rfind('-')
+    rel = filename[relIndex+1:archIndex]
+
+    verIndex = filename[:relIndex].rfind('-')
+    ver = filename[verIndex+1:relIndex]
+
+    epochIndex = filename.find(':')
+    if epochIndex == -1:
+        epoch = ''
+    else:
+        epoch = filename[:epochIndex]
+
+    name = filename[epochIndex + 1:verIndex]
+    return {'name': name, 'version': '{}-{}'.format(ver, rel)}
+
+
+uri = 'https://www.redhat.com/archives/rhsa-announce/{}-{}.txt.gz'
+
+regexMails = re.compile(r'^-+BEGIN PGP SIGNED MESSAGE-+(?P<mail>.*?)-+BEGIN PGP SIGNATURE-+', re.MULTILINE|re.DOTALL)
+
+regexMeta = re.compile(r'^Synopsis:\s+(?P<synopsis>[^\n]+).*?Advisory ID:\s+(?P<advisory>\S+).*?'
+                       r'Issue date:\s+(?P<date>\S+).*?(?:^CVE Names:\s+(?P<cves>.*?))?=+',
+                       re.MULTILINE | re.DOTALL)
+
+regexPackages = re.compile(r'(?P<p>^\S+\.(?:src|noarch|x86_64)\.rpm)+', re.MULTILINE|re.DOTALL)
+
+regexPkgMeta = re.compile(r'\.el(?P<release>\d+)(?:[^\.]+)?\.(?:\d+\.)?(?P<arch>[^\.]+)\.rpm', re.MULTILINE|re.DOTALL)
+
+period = datetime.now()
+
+for month in range(0, 2):
+
+    advisories = {}
+
+    r = requests.get(uri.format(period.year, period.strftime('%B')), stream=True, timeout=60)
+    print('Downloading {}.'.format(r.url))
+
+    if r.status_code != 200:
+        print('Could not fetch {}'.format(r.url))
+        period = (period.replace(day=1) - timedelta(days=1)).replace(day=1)
+        continue
+
+    print('Saving downloaded data.')
+    with open('/tmp/redhat-{}-{}.txt.gz'.format(period.year, period.month), 'wb') as fd:
+        fd.write(r.raw.read())
+
+    print('Decompressing.')
+    with gzip.open('/tmp/redhat-{}-{}.txt.gz'.format(period.year, period.month), 'rb') as f:
+        data = f.read()
+
+    for mail in regexMails.findall(data.decode("utf-8")):
+
+        m = regexMeta.search(mail)
+        group = m.groupdict()
+
+        date = datetime.strptime(group['date'], '%Y-%m-%d')
+        packages = list(set(regexPackages.findall(mail)))
+        cves = group['cves'].split() if group['cves'] else []
+
+        advisory = {
+            'date': date.strftime('%Y-%m-%d %H:%M:%S'),
+            'description': group['synopsis'],
+            'name': group['advisory'],
+            'cves': cves,
+            'packages':
+                {
+                    'source': [],
+                    'binary': []
+                }
+        }
+
+        releases = []
+        binpkgs_by_release = {}
+        srcpkgs_by_release = {}
+
+        for package in packages:
+            m2 = regexPkgMeta.search(package)
+            group2 = m2.groupdict()
+
+            release = group2['release']
+
+            if release not in releases:
+                releases.append(release)
+                binpkgs_by_release[release] = []
+                srcpkgs_by_release[release] = []
+
+            if 'src' in group2['arch']:
+                srcpkgs_by_release[release].append(package)
+            else:
+                binpkgs_by_release[release].append(package)
+
+        for release in releases:
+            if release not in advisories:
+                advisories[release] = []
+            advisory['packages']['source'] = [splitFilename(x) for x in srcpkgs_by_release[release]]
+            advisory['packages']['binary'] = [splitFilename(x) for x in binpkgs_by_release[release]]
+            advisories[release].append(copy.deepcopy(advisory))
+
+    for release in advisories:
+        release_path = '{}/redhat/{}.x/{}'.format(args.destination, release, period.year)
+        new_file = '{}/.{}.json'.format(release_path, period.strftime('%B').lower())
+        orig_file = '{}/{}.json'.format(release_path, period.strftime('%B').lower())
+
+        os.makedirs(release_path, exist_ok=True)
+
+        with open(new_file, 'w') as fp:
+            json.dump(advisories[release], fp=fp, indent=4, sort_keys=True)
+
+        if not os.path.isfile(orig_file) or not filecmp.cmp(new_file, orig_file):
+            print('Saving {}'.format(orig_file))
+            shutil.copyfile(new_file, orig_file)
+
+        os.unlink(new_file)
+
+    period = (period.replace(day=1) - timedelta(days=1)).replace(day=1)
+
