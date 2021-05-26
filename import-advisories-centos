@@ -1,0 +1,180 @@
+#!/usr/bin/env python3.5
+
+import requests
+import gzip
+import os
+import re
+from datetime import datetime, timedelta
+import json
+import argparse
+import filecmp
+import shutil
+import copy
+
+parser = argparse.ArgumentParser(description='Import advisories for CentOS')
+parser.add_argument('--debug', help='Increase output verbosity', action="store_true")
+parser.add_argument('-d', '--destination', default='/tmp', help='Where to store the output files hierarchy.')
+parser.add_argument('-c', '--cache-dir', default='/tmp/import-advisories-centos', help='Where to store the cached webpages.')
+args = parser.parse_args()
+
+def splitFilename(filename):
+    """
+    Pass in a standard style rpm fullname
+
+    Return a name, version, release, epoch, arch, e.g.::
+        foo-1.0-1.i386.rpm returns foo, 1.0, 1, i386
+        1:bar-9-123a.ia64.rpm returns bar, 9, 123a, 1, ia64
+    """
+
+    if filename[-4:] == '.rpm':
+        filename = filename[:-4]
+
+    archIndex = filename.rfind('.')
+    arch = filename[archIndex+1:]
+
+    relIndex = filename[:archIndex].rfind('-')
+    rel = filename[relIndex+1:archIndex]
+
+    verIndex = filename[:relIndex].rfind('-')
+    ver = filename[verIndex+1:relIndex]
+
+    epochIndex = filename.find(':')
+    if epochIndex == -1:
+        epoch = ''
+    else:
+        epoch = filename[:epochIndex]
+
+    name = filename[epochIndex + 1:verIndex]
+    return name, ver, rel, epoch, arch
+
+
+if not os.path.isdir(args.cache_dir):
+    print('Creating cache directory {}'.format(args.cache_dir))
+    os.mkdir(args.cache_dir)
+
+uri = 'https://lists.centos.org/pipermail/centos-announce/{}-{}.txt.gz'
+
+regexMain = re.compile(r'Date:\s+(?P<date>.*?)\n(?:Subject: \[CentOS-announce\]\s+(?P<subject>CE[SBE]A.*?)\n'
+                       r'Message-ID:.*?(?P<url>https://\S+).*?\n(?:i386:(?P<packages_32>.*?)\n)*x86_64:\n'
+                       r'(?P<packages_64>.*?)Source:(?P<packages_src>.*?)\s*(--|\Z))*',
+                   re.MULTILINE | re.DOTALL)
+regexSubject = re.compile(r'(?P<name>CE[BSE]A-\d{4}:\S+)\s+.*centos[\s,-]+(?P<release>\d)\s+(?P<desc>.*)', re.IGNORECASE)
+
+regexPackages = re.compile(r'(?P<sha256>\w+)\s+(?P<file>[^\n]+)', re.MULTILINE)
+
+regexCves = re.compile(r'(https://www.redhat.com/security/data/cve/(?P<cve>CVE-\d+-\d+)\.html)')
+
+advisories = {}
+
+period = datetime.now()
+for month in range(0, 2):
+
+    r = requests.get(uri.format(period.year, period.strftime('%B')))
+    print('Downloading {}.'.format(r.url))
+
+    if r.status_code != 200:
+        print('Could not fetch {}'.format(r.url))
+        continue
+
+    print('Saving downloaded data.')
+    with open('/tmp/{}-{}.txt.gz'.format(period.year, period.month), 'wb') as fd:
+        for chunk in r.iter_content():
+            fd.write(chunk)
+
+    print('Decompressing.')
+    with gzip.open('/tmp/{}-{}.txt.gz'.format(period.year, period.month), 'rb') as f:
+        data = f.read()
+
+    for m in regexMain.finditer(data.decode("utf-8")):
+        group = m.groupdict()
+
+        if not group['subject']:
+            continue
+
+        subject = " ".join(group['subject'].split())
+        date = datetime.strptime(group['date'], '%a, %d %b %Y %H:%M:%S +0000')
+        url = group['url']
+        m2 = re.search(regexSubject, subject)
+        if not m2:
+            print('WARNING: Skipping subject {}'.format(subject))
+            continue
+        name = m2.groupdict()['name']
+        release = m2.groupdict()['release']
+        description = m2.groupdict()['desc']
+        print('{} ({}): {} -> {}'.format(name, date, release, description))
+
+        packages = {}
+
+        if 'packages_64' in group and group['packages_64']:
+            packages['binary'] = []
+
+            names = []
+            for p in regexPackages.finditer(group['packages_64']):
+                group_64 = p.groupdict()
+                (n, v, r, e, a) = splitFilename(group_64['file'])
+                if n not in names:
+                    names.append(n)
+                    packages['binary'].append(
+                        {'name': n, 'version': '{}-{}'.format(v, r)}
+                    )
+
+        if 'packages_src' in group and group['packages_src']:
+            packages['source'] = []
+
+            for p in regexPackages.finditer(group['packages_src']):
+                group_src = p.groupdict()
+                (n, v, r, e, a) = splitFilename(group_src['file'])
+                packages['source'].append(
+                        {'name': n, 'version': '{}-{}'.format(v, r)}
+                )
+
+        # Get CVES
+        # Download only once since it's very slow to download the upstream details on every advisory.
+        cache_file = "{}/{}".format(args.cache_dir, os.path.basename(url))
+        if not os.path.isfile(cache_file):
+            print('Downloading {}.'.format(url))
+            r = requests.get(url)
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                f.write(r.text)
+                contents = r.text
+        else:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                contents = f.read()
+
+        cves = []
+        for m in regexCves.finditer(contents):
+            cves.append(m.group(2))
+        cves = list(set(cves))
+
+        advisory = {
+            'date': date.strftime('%Y-%m-%d %H:%M:%S'),
+            'description': description,
+            'url': url,
+            'name': name,
+            'packages': packages,
+            'cves': cves
+        }
+
+        if not release in advisories:
+            advisories[release] = []
+
+        advisories[release].append(copy.deepcopy(advisory))
+
+    for release in advisories:
+
+        release_path = '{}/centos/{}.x/{}'.format(args.destination, release, period.year)
+        new_file = '{}/.{}.json'.format(release_path, period.strftime('%B').lower())
+        orig_file = '{}/{}.json'.format(release_path, period.strftime('%B').lower())
+
+        os.makedirs(release_path, exist_ok=True)
+
+        with open(new_file, 'w') as fp:
+            json.dump(advisories[release], fp=fp, indent=4, sort_keys=True)
+
+        if not os.path.isfile(orig_file) or not filecmp.cmp(new_file, orig_file):
+            print('Saving {}'.format(orig_file))
+            shutil.copyfile(new_file, orig_file)
+
+        os.unlink(new_file)
+
+    period = (period.replace(day=1) - timedelta(days=1)).replace(day=1)
